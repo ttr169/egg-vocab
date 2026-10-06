@@ -14,6 +14,8 @@
   const DAY_MS = 24 * 60 * 60 * 1000;
   const SEED = window.SEED_WORDS || {};
   const EN = window.SEED_EN || {};   // 课本英语注释
+  // 打包离线版会在 index.html 标记此模式：不允许任何数据上传或网络请求。
+  const OFFLINE_MODE = document.documentElement.dataset.eggyOffline === "true";
 
   // ─────────── 艾宾浩斯 9 级曲线 (间隔) ───────────
   const EBB = [
@@ -189,14 +191,29 @@
     return window.speechSynthesis.getVoices().some(v => /^ja/i.test(v.lang));
   }
   if ("speechSynthesis" in window) window.speechSynthesis.onvoiceschanged = () => { voiceCache = null; };
+  let recordedAudio = null;
+  let speechRequest = 0;
   function speak(text, lang) {
+    const request = ++speechRequest;
+    if (recordedAudio) { recordedAudio.pause(); recordedAudio = null; }
+    window.speechSynthesis?.cancel();
+    const path = window.EGGY_AUDIO?.[text];
+    if (path && (!lang || /^ja/i.test(lang))) {
+      const audio = new Audio(path);
+      recordedAudio = audio;
+      audio.playbackRate = Math.min(1.4, Math.max(0.6, Number(prefs.ttsRate) || 0.95)) / 0.95;
+      audio.play().catch(() => {
+        if (request === speechRequest) toast("音频播放失败，请再点一次朗读，并确认 audio 文件夹完整", "rose");
+      });
+      return;
+    }
     if (!text || !("speechSynthesis" in window)) { if (text) toast("本设备不支持朗读", "rose"); return; }
     try {
       const target = lang || prefs.ttsVoice || "ja-JP";
       // 日语朗读前自检：没有日语语音包时明确提醒，避免用中文/英语声音读出乱音
-      if (/^ja/i.test(target) && !japaneseVoiceAvailable() && !jaWarned) {
-        jaWarned = true;
-        toast("⚠️ 本设备未装日语语音包，发音会不准（设置页有解决办法）", "rose");
+      if (/^ja/i.test(target) && !japaneseVoiceAvailable()) {
+        toast("这个自定义词没有配音，本设备也未安装日语语音", "rose");
+        return;
       }
       window.speechSynthesis.cancel();
       const u = new SpeechSynthesisUtterance(text);
@@ -981,6 +998,10 @@
   // ================================================================
   function renderTtsCheck() {
     const el = $("#ttsCheck"); if (!el) return;
+    if (window.EGGY_AUDIO) {
+      el.innerHTML = '<div class="h">✅ 内置 Nanami 日语配音</div><p class="muted">课本词汇和例句直接播放音频，可离线使用。自行添加的词使用本机日语语音。</p>';
+      return;
+    }
     if (!("speechSynthesis" in window)) {
       el.innerHTML = '<div class="h">❌ 此浏览器不支持语音合成</div><p class="muted">请换用 Chrome / Edge / Safari。</p>';
       return;
@@ -999,7 +1020,13 @@
   }
 
   function renderSettings() {
+    const offlineBanner = OFFLINE_MODE ? `
+      <div class="card" style="border-color:var(--mint)">
+        <div class="card-head"><h2>🔒 离线本地模式</h2><span class="sub">不联网</span></div>
+        <p class="muted">本离线包不会连接房间码、GitHub、翻译或例句服务。学习进度仅保存在这台设备当前浏览器中；请定期导出 JSON 备份。</p>
+      </div>` : "";
     root.innerHTML = `
+      ${offlineBanner}
       <div class="card">
         <div class="card-head"><h2>发音自检</h2><span class="sub">日语 TTS</span></div>
         <div class="sync-box" id="ttsCheck"><div class="h">检测中…</div></div>
@@ -1329,6 +1356,7 @@
   }
 
   async function roomPush(silent) {
+    if (OFFLINE_MODE) { if (!silent) toast("离线版不会上传数据", "rose"); return false; }
     const code = (prefs.roomCode || "").trim();
     if (!code) { if (!silent) toast("请先创建或加入房间", "rose"); return false; }
     const el = roomStatusEl();
@@ -1361,6 +1389,7 @@
   }
 
   async function roomPull() {
+    if (OFFLINE_MODE) { toast("离线版不会连接房间码", "rose"); return; }
     const code = (prefs.roomCode || "").trim();
     if (!code) { toast("请先创建或加入房间", "rose"); return; }
     const el = roomStatusEl();
@@ -1383,6 +1412,7 @@
 
   // 打开页面时自动从房间恢复进度（有房间码就静默合并一次）
   async function autoRoomSync() {
+    if (OFFLINE_MODE) return;
     const code = (prefs.roomCode || "").trim();
     if (!code) return;
     try {
@@ -1397,6 +1427,7 @@
   }
 
   async function roomCreate() {
+    if (OFFLINE_MODE) { toast("离线版不会创建云端房间", "rose"); return; }
     const old = (prefs.roomCode || "").trim();
     if (old) {
       const go = confirm(`当前已加入房间 ${old}。\n确定要创建新房间吗？\n（旧房间码会保留在下方"历史房间码"里，云端旧进度不会丢）`);
@@ -1428,6 +1459,7 @@
   function gistFilename() { return "eggy-vocab-backup.json"; }
 
   async function syncPush() {
+    if (OFFLINE_MODE) { toast("离线版不会上传到 GitHub", "rose"); return null; }
     const token = prefs.gistToken;
     let gid = prefs.gistId;
     if (!token) { toast("请先在下方填入 GitHub Token", "rose"); return null; }
@@ -1474,6 +1506,7 @@
   }
 
   async function syncPull() {
+    if (OFFLINE_MODE) { toast("离线版不会连接 GitHub", "rose"); return; }
     const token = prefs.gistToken;
     const gid = prefs.gistId;
     if (!token || !gid) { toast("需要 Token 和 Gist ID", "rose"); return; }
@@ -1511,6 +1544,7 @@
 
   // ─────────── 翻译 / 例句 (联网) ───────────
   async function fetchTranslation(term) {
+    if (OFFLINE_MODE) return "";
     if (!prefs.apiTranslate) return "";
     try {
       const url = prefs.apiTranslate.replace("{w}", encodeURIComponent(term));
@@ -1528,6 +1562,7 @@
   async function fetchExamples(term) {
     const s = SEED[term.toLowerCase().trim()];
     if (s && s.examples) return s.examples.map(e => ({ en: e.en, cn: e.cn }));
+    if (OFFLINE_MODE) return [];
     // 设置了自定义例句 API 时优先使用；支持 [{en,cn}]、{examples:[...]}、{results:[...]} 三种常见格式。
     try {
       const url = prefs.apiExamples

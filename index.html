@@ -423,13 +423,69 @@
     }
     .section-title .bar { width: 4px; height: 16px; border-radius: 999px; background: var(--pink); }
 
+    /* ============ Practice calendar ============ */
+    .practice-hero {
+      display: flex; align-items: center; justify-content: space-between; gap: 18px;
+      padding: 20px; margin-bottom: 14px; border-radius: 22px;
+      background: linear-gradient(135deg, #E9F4FF 0%, #FFFFFF 62%, #FFF3C9 100%);
+      border: 1px solid #C9E0F5; box-shadow: var(--shadow-1);
+    }
+    .practice-kicker { color: var(--blue); font-size: 12px; font-weight: 800; letter-spacing: .08em; }
+    .practice-big { margin: 4px 0; font-size: 27px; font-weight: 900; color: var(--ink); }
+    .practice-big span { font-size: 14px; color: var(--ink-soft); font-weight: 700; }
+    .today-ring {
+      flex: 0 0 76px; width: 76px; height: 76px; border-radius: 50%;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      background: #fff; border: 6px solid var(--blue-soft); color: var(--blue);
+      box-shadow: 0 5px 14px rgba(74, 137, 194, .14);
+    }
+    .today-ring.done { background: var(--blue); border-color: var(--blue); color: #fff; }
+    .today-ring strong { font-size: 25px; line-height: 1; }
+    .today-ring small { margin-top: 3px; font-size: 10px; font-weight: 800; }
+    .calendar-card { padding: 14px; }
+    .calendar-head { display: grid; grid-template-columns: 42px 1fr 42px; align-items: center; text-align: center; margin-bottom: 12px; }
+    .calendar-head h2 { margin: 0; font-size: 17px; }
+    .cal-nav { width: 38px; height: 38px; border: 0; border-radius: 50%; background: var(--blue-soft); color: #3F7FB9; font-size: 28px; line-height: 1; }
+    .cal-today { border: 0; background: none; color: var(--blue); font-size: 10px; font-weight: 700; padding: 2px 8px; }
+    .calendar-weekdays, .calendar-grid { display: grid; grid-template-columns: repeat(7, 1fr); }
+    .calendar-weekdays { margin-bottom: 6px; color: var(--ink-faint); font-size: 11px; font-weight: 800; text-align: center; }
+    .calendar-grid { gap: 3px 0; }
+    .cal-day { min-height: 54px; display: flex; flex-direction: column; align-items: center; justify-content: flex-start; padding-top: 3px; }
+    .cal-day-num { width: 31px; height: 31px; border-radius: 50%; display: grid; place-items: center; font-size: 13px; font-weight: 750; }
+    .cal-day-num.met { background: var(--blue); color: #fff; box-shadow: 0 4px 9px rgba(74, 137, 194, .35); }
+    .cal-day.today .cal-day-num:not(.met) { border: 2px solid var(--egg-deep); background: var(--egg-soft); }
+    .cal-day.outside { opacity: .26; }
+    .cal-day.future { opacity: .38; }
+    .cal-day.weekend .cal-day-num { color: var(--ink-faint); }
+    .cal-min { min-height: 13px; margin-top: 2px; color: var(--blue); font-size: 9px; font-weight: 700; }
+    .calendar-legend { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); color: var(--ink-soft); font-size: 10px; }
+    .legend-dot { display: inline-block; width: 10px; height: 10px; margin-right: 4px; border-radius: 50%; background: var(--blue); vertical-align: -1px; }
+    .weekly-list { display: flex; flex-direction: column; gap: 8px; }
+    .week-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 11px 12px; border-radius: 13px; background: var(--panel-2); border: 1px solid var(--line); }
+    .week-row.met { background: var(--blue-soft); border-color: #BCD8F1; }
+    .week-row strong { font-size: 13px; }
+    .week-row small { display: block; min-height: 14px; color: var(--blue); font-size: 10px; font-weight: 700; }
+    .week-result { display: flex; align-items: center; gap: 10px; }
+    .week-result b { color: var(--ink-soft); font-size: 12px; }
+    .week-result span { font-size: 24px; }
+    .practice-note { border-style: dashed; background: #FFFDF8; }
+    .practice-note strong { font-size: 13px; }
+    .practice-note p { margin: 5px 0 0; color: var(--ink-soft); font-size: 11px; line-height: 1.6; }
+    @media (max-width: 430px) {
+      .practice-hero { padding: 16px; }
+      .practice-big { font-size: 22px; }
+      .today-ring { flex-basis: 68px; width: 68px; height: 68px; }
+      .cal-day { min-height: 49px; }
+      .cal-day-num { width: 29px; height: 29px; }
+    }
+
     /* ============ Bottom tab bar ============ */
     .tabbar {
       position: fixed; left: 0; right: 0; bottom: 0;
       padding: 8px 8px calc(8px + var(--safe-bot));
       background: var(--panel);
       border-top: 1px solid var(--line);
-      display: grid; grid-template-columns: repeat(5, 1fr);
+      display: grid; grid-template-columns: repeat(6, 1fr);
       z-index: 40;
       box-shadow: 0 -8px 24px rgba(180, 150, 100, .14);
     }
@@ -500,6 +556,7 @@
     <button data-tab="review"><span class="ico">▶️</span><span class="lbl">开始复习</span><span class="badge-dot" id="dotReview"></span></button>
     <button data-tab="library"><span class="ico">🗂️</span><span class="lbl">复习库</span><span class="badge-dot" id="dotLibrary"></span></button>
     <button data-tab="graduated"><span class="ico">🎓</span><span class="lbl">已毕业</span><span class="badge-dot" id="dotGrad"></span></button>
+    <button data-tab="practice"><span class="ico">📅</span><span class="lbl">履历</span></button>
     <button data-tab="settings"><span class="ico">⚙️</span><span class="lbl">设置</span></button>
   </nav>
 

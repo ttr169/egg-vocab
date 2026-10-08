@@ -12,6 +12,9 @@
   const STORE_KEY = "eggy_vocab_state_v2";   // v2 = 日语课本词库
   const PREFS_KEY = "eggy_vocab_prefs_v1";
   const DAY_MS = 24 * 60 * 60 * 1000;
+  const DAILY_PRACTICE_SECONDS = 15 * 60;
+  const WEEKLY_PRACTICE_SECONDS = 75 * 60;
+  const MAX_QUESTION_SECONDS = 3 * 60;
   const SEED = window.SEED_WORDS || {};
   const EN = window.SEED_EN || {};   // 课本英语注释
   // 打包离线版会在 index.html 标记此模式：不允许任何数据上传或网络请求。
@@ -37,6 +40,7 @@
     words: {},            // term(lowercase) → word object
     order: [],            // 添加顺序的 key 列表
     history: [],          // 每日统计
+    practice: {},         // YYYY-MM-DD -> { deviceId: seconds }，跨设备按设备累计
     streak: { current: 0, best: 0, lastDay: null },
     createdAt: Date.now(),
     updatedAt: Date.now(),
@@ -106,9 +110,21 @@
     if (!state.words || typeof state.words !== "object") state.words = {};
     if (!Array.isArray(state.order)) state.order = Object.keys(state.words);
     if (!Array.isArray(state.history)) state.history = [];
+    if (!state.practice || typeof state.practice !== "object" || Array.isArray(state.practice)) state.practice = {};
     if (!state.streak || typeof state.streak !== "object") state.streak = { current: 0, best: 0, lastDay: null };
     if (!state.deviceId) state.deviceId = makeId("device");
     state.schema = 2;
+    Object.keys(state.practice).forEach(day => {
+      const devices = state.practice[day];
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || !devices || typeof devices !== "object" || Array.isArray(devices)) {
+        delete state.practice[day]; return;
+      }
+      Object.keys(devices).forEach(deviceId => {
+        const seconds = Math.max(0, Math.round(Number(devices[deviceId]) || 0));
+        if (seconds) devices[deviceId] = seconds;
+        else delete devices[deviceId];
+      });
+    });
     Object.values(state.words).forEach(w => {
       if (!w || typeof w !== "object") return;
       w.reviewedAt = Number(w.reviewedAt || 0);
@@ -231,6 +247,33 @@
   const root = $("#root");
   const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
   const todayKey = (ts = Date.now()) => { const d = new Date(ts); d.setHours(0,0,0,0); return d.getTime(); };
+  const localDateKey = (ts = Date.now()) => {
+    const d = new Date(ts);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  };
+  function practiceSecondsForDate(day) {
+    return Object.values(state.practice?.[day] || {}).reduce((sum, seconds) => sum + Math.max(0, Number(seconds) || 0), 0);
+  }
+  function addPracticeSeconds(seconds) {
+    const amount = Math.max(0, Math.min(MAX_QUESTION_SECONDS, Math.round(Number(seconds) || 0)));
+    if (!amount) return 0;
+    const day = localDateKey();
+    const deviceId = state.deviceId || "legacy-device";
+    state.practice[day] ||= {};
+    state.practice[day][deviceId] = Math.max(0, Number(state.practice[day][deviceId]) || 0) + amount;
+    const keep = Object.keys(state.practice).sort().slice(-400);
+    const keepSet = new Set(keep);
+    Object.keys(state.practice).forEach(k => { if (!keepSet.has(k)) delete state.practice[k]; });
+    persist();
+    return amount;
+  }
+  function formatPracticeTime(seconds, compact = false) {
+    const total = Math.max(0, Math.round(Number(seconds) || 0));
+    if (compact) return `${Math.round(total / 60)} 分钟`;
+    if (total < 60) return `${total} 秒`;
+    const minutes = Math.floor(total / 60), remain = total % 60;
+    return remain ? `${minutes}分${remain}秒` : `${minutes}分钟`;
+  }
 
   let toastTimer = null;
   function toast(msg, kind = "") {
@@ -300,11 +343,43 @@
   // ─────────── 路由 ───────────
   let currentTab = "words";
   let session = null; // {queue, idx, results}
+  let practiceMonth = new Date(new Date().getFullYear(), new Date().getMonth(), 1);
+  let questionTimer = null;
+
+  function beginQuestionTiming() {
+    questionTimer = {
+      visibleSince: document.visibilityState === "visible" ? Date.now() : 0,
+      activeMs: 0,
+      answered: false
+    };
+  }
+  function pauseQuestionTiming(now = Date.now()) {
+    if (!questionTimer || questionTimer.answered || !questionTimer.visibleSince) return;
+    questionTimer.activeMs += Math.max(0, now - questionTimer.visibleSince);
+    questionTimer.visibleSince = 0;
+  }
+  function resumeQuestionTiming(now = Date.now()) {
+    if (!questionTimer || questionTimer.answered || questionTimer.visibleSince) return;
+    questionTimer.visibleSince = now;
+  }
+  function recordAnsweredQuestion() {
+    if (!questionTimer || questionTimer.answered) return 0;
+    pauseQuestionTiming();
+    questionTimer.answered = true;
+    const seconds = Math.min(MAX_QUESTION_SECONDS, Math.max(1, Math.round(questionTimer.activeMs / 1000)));
+    if (session) session.practiceSeconds = (session.practiceSeconds || 0) + seconds;
+    return addPracticeSeconds(seconds);
+  }
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") resumeQuestionTiming();
+    else pauseQuestionTiming();
+  });
 
   function setTab(t) {
     // 复习进行中点其它 Tab：确认后放弃本轮并真正切换
     if (session && !session.done) {
       if (!confirm("复习还没做完，确定要退出吗？\n（已答过的题进度保留，没答完的不计入本轮）")) return;
+      questionTimer = null;
       session = null;
     }
     currentTab = t;
@@ -320,9 +395,9 @@
     const due = reviewCount();
     $("#dotReview").classList.toggle("show", due > 0);
     $("#dotReview").textContent = "";
-    // 今日目标
-    const todayDone = (state.history.find(h => h.date === todayKey()) || {}).reviewed || 0;
-    $("#todayGoalBadge").textContent = `🎯 ${todayDone}/${prefs.dailyGoal}`;
+    // 今日目标改为实际做题时间（打开页面不计时）
+    const todayMinutes = Math.round(practiceSecondsForDate(localDateKey()) / 60);
+    $("#todayGoalBadge").textContent = `🎯 ${todayMinutes}/15分`;
   }
 
   function render() {
@@ -334,6 +409,7 @@
       case "review":    return renderReview();
       case "library":   return renderLibrary();
       case "graduated": return renderGraduated();
+      case "practice":  return renderPracticeHistory();
       case "settings":  return renderSettings();
     }
   }
@@ -527,7 +603,7 @@
       <div class="card" style="text-align:center">
         <div class="card-head"><h2>开始复习</h2><span class="sub">${due.length} 词 · 本轮</span></div>
         <p class="muted">答对升 1 级、答错降 2 级。完成 30 天后的最终复习才毕业 🎓</p>
-        <p class="muted" style="margin-bottom:14px">今日目标：${(state.history.find(h=>h.date===todayKey())||{}).reviewed||0} / ${prefs.dailyGoal}</p>
+        <p class="muted" style="margin-bottom:14px">今日做题时间：${formatPracticeTime(practiceSecondsForDate(localDateKey()), true)} / 15 分钟</p>
         <button class="btn btn-pink lg" id="startBtn">开始复习 →</button>
       </div>
       <div class="card">
@@ -552,6 +628,7 @@
       idx: 0,
       results: [],
       startTime: Date.now(),
+      practiceSeconds: 0,
       done: false
     };
     if (session.queue.length === 0) { session = null; toast("暂无待复习", "gold"); setTab("review"); return; }
@@ -580,8 +657,10 @@
         <div id="studyBody"></div>
       </div>
     `;
+    beginQuestionTiming();
     $("#quitBtn").addEventListener("click", () => {
       if (!confirm("复习还没做完，确定要退出吗？\n（已答过的题进度保留，没答完的不计入本轮）")) return;
+      questionTimer = null;
       session = null;
       setTab("review");
     });
@@ -665,6 +744,7 @@
           else if (b === btn) b.classList.add("wrong");
         });
         if (prefs.autoTTS) speak(w.term);
+        recordAnsweredQuestion();
         addNextBtn(body, w, isRight, dir);
       });
     });
@@ -693,6 +773,7 @@
           if (b.dataset.val === w.term) b.classList.add("right");
           else if (b === btn) b.classList.add("wrong");
         });
+        recordAnsweredQuestion();
         addNextBtn(body, w, isRight, "listening");
       });
     });
@@ -776,6 +857,7 @@
         ? `<span class="ok">🎉 正确！${esc(w.term)}${w.reading ? ` <small>(${esc(w.reading)})</small>` : ""}</span>`
         : `<span class="no">红色假名拼错了。正确读音：<b>${esc(w.term)}</b>${w.reading ? ` <small>(${esc(w.reading)})</small>` : ""}</span>`;
       if (prefs.autoTTS) speak(w.term);
+      recordAnsweredQuestion();
       addNextBtn(body, w, ok, "kana");
     };
     $$(".kana-key", body).forEach(btn => btn.addEventListener("click", () => {
@@ -796,6 +878,7 @@
   function shuffle(arr) { const a = arr.slice(); for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; }
 
   function grade(w, correct, mode) {
+    recordAnsweredQuestion();
     scheduleNext(w, correct);
     session.results.push({ key: w.key, correct, mode });
     session.idx++;
@@ -816,6 +899,7 @@
   }
 
   function finishSession() {
+    questionTimer = null;
     session.done = true;
     session.endTime = Date.now();
     const total = session.results.length;
@@ -835,7 +919,7 @@
     const total = session.results.length;
     const correct = session.results.filter(r => r.correct).length;
     const pct = total ? Math.round(correct / total * 100) : 0;
-    const minutes = Math.max(1, Math.round((session.endTime - session.startTime) / 60000));
+    const practiceTime = formatPracticeTime(session.practiceSeconds || 0);
     root.innerHTML = `
       <div class="card complete">
         <div class="egg">🥚</div>
@@ -844,7 +928,7 @@
         <div class="summary">
           <div class="stat"><div class="v">${total}</div><div class="l">复习数</div></div>
           <div class="stat"><div class="v">${pct}%</div><div class="l">正确率</div></div>
-          <div class="stat"><div class="v">${minutes}</div><div class="l">分钟</div></div>
+          <div class="stat"><div class="v" style="font-size:18px">${practiceTime}</div><div class="l">实际做题</div></div>
         </div>
         <div class="row" style="justify-content:center">
           <button class="btn btn-pink" id="againBtn">再来一轮</button>
@@ -853,6 +937,104 @@
       </div>`;
     $("#againBtn").addEventListener("click", () => { session = null; startSession(); });
     $("#backBtn").addEventListener("click", () => { session = null; setTab("words"); });
+  }
+
+  // ================================================================
+  //  练习履历 · 只统计答题页显示到作答之间的可见时间
+  // ================================================================
+  function startOfWeek(date) {
+    const d = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+    const mondayOffset = (d.getDay() + 6) % 7;
+    d.setDate(d.getDate() - mondayOffset);
+    return d;
+  }
+  function addCalendarDays(date, days) {
+    const d = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+    d.setDate(d.getDate() + days);
+    return d;
+  }
+  function practiceForWeek(monday) {
+    let seconds = 0;
+    for (let i = 0; i < 7; i++) seconds += practiceSecondsForDate(localDateKey(addCalendarDays(monday, i)));
+    return seconds;
+  }
+  function shortDate(date) { return `${date.getMonth() + 1}/${date.getDate()}`; }
+
+  function renderPracticeHistory() {
+    const now = new Date();
+    const today = localDateKey(now);
+    const todaySeconds = practiceSecondsForDate(today);
+    const weekday = now.getDay() >= 1 && now.getDay() <= 5;
+    const monthStart = new Date(practiceMonth.getFullYear(), practiceMonth.getMonth(), 1);
+    const gridStart = startOfWeek(monthStart);
+    const days = Array.from({ length: 42 }, (_, i) => addCalendarDays(gridStart, i));
+    const thisWeek = startOfWeek(now);
+    // Keep the weekly summary aligned with the six complete week rows shown
+    // in the selected month's calendar, including the adjacent-month days.
+    const calendarWeeks = Array.from({ length: 6 }, (_, i) => addCalendarDays(gridStart, i * 7));
+
+    root.innerHTML = `
+      <div class="practice-hero">
+        <div>
+          <div class="practice-kicker">本周学习目标</div>
+          <div class="practice-big">${formatPracticeTime(practiceForWeek(thisWeek), true)} <span>/ 75 分钟</span></div>
+          <div class="muted">周一到周五每天完成 15 分钟，周末可补做</div>
+        </div>
+        <div class="today-ring ${weekday && todaySeconds >= DAILY_PRACTICE_SECONDS ? "done" : ""}">
+          <strong>${Math.round(todaySeconds / 60)}</strong><small>/15 分</small>
+        </div>
+      </div>
+
+      <div class="card calendar-card">
+        <div class="calendar-head">
+          <button class="cal-nav" id="prevMonth" aria-label="上个月">‹</button>
+          <div>
+            <h2>${practiceMonth.getFullYear()}年 ${practiceMonth.getMonth() + 1}月</h2>
+            <button class="cal-today" id="todayMonth">回到本月</button>
+          </div>
+          <button class="cal-nav" id="nextMonth" aria-label="下个月">›</button>
+        </div>
+        <div class="calendar-weekdays">${["一","二","三","四","五","六","日"].map(x => `<span>${x}</span>`).join("")}</div>
+        <div class="calendar-grid">
+          ${days.map(d => {
+            const key = localDateKey(d);
+            const seconds = practiceSecondsForDate(key);
+            const isWeekday = d.getDay() >= 1 && d.getDay() <= 5;
+            const met = isWeekday && seconds >= DAILY_PRACTICE_SECONDS;
+            const outside = d.getMonth() !== practiceMonth.getMonth();
+            const future = d > new Date(now.getFullYear(), now.getMonth(), now.getDate());
+            return `<div class="cal-day ${outside ? "outside" : ""} ${future ? "future" : ""} ${!isWeekday ? "weekend" : ""} ${key === today ? "today" : ""}">
+              <span class="cal-day-num ${met ? "met" : ""}">${d.getDate()}</span>
+              <span class="cal-min">${seconds ? Math.round(seconds / 60) + "分" : ""}</span>
+            </div>`;
+          }).join("")}
+        </div>
+        <div class="calendar-legend"><span><i class="legend-dot"></i> 工作日满 15 分钟</span><span>周末时间计入 75 分钟目标</span></div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h2>${practiceMonth.getMonth() + 1}月日历周累计</h2><span class="sub">与上方日历对应，包含周末补做时间</span></div>
+        <div class="weekly-list">
+          ${calendarWeeks.map(monday => {
+            const sunday = addCalendarDays(monday, 6);
+            const seconds = practiceForWeek(monday);
+            const met = seconds >= WEEKLY_PRACTICE_SECONDS;
+            return `<div class="week-row ${met ? "met" : ""}">
+              <div><strong>${shortDate(monday)}–${shortDate(sunday)}</strong><small>${monday.getTime() === thisWeek.getTime() ? "本周" : ""}</small></div>
+              <div class="week-result"><b>${formatPracticeTime(seconds, true)}</b><span aria-label="${met ? "达标" : "未达标"}">${met ? "👍" : "😢"}</span></div>
+            </div>`;
+          }).join("")}
+        </div>
+      </div>
+
+      <div class="card practice-note">
+        <strong>计时规则</strong>
+        <p>只统计题目显示后到完成作答之间、页面处于可见状态的时间；看答案后停留、打开网页不答题、切到后台都不计时。单题最多计 3 分钟。周六、周日的练习时间也会计入当周 75 分钟目标。</p>
+      </div>`;
+
+    $("#prevMonth").addEventListener("click", () => { practiceMonth = new Date(practiceMonth.getFullYear(), practiceMonth.getMonth() - 1, 1); renderPracticeHistory(); });
+    $("#nextMonth").addEventListener("click", () => { practiceMonth = new Date(practiceMonth.getFullYear(), practiceMonth.getMonth() + 1, 1); renderPracticeHistory(); });
+    $("#todayMonth").addEventListener("click", () => { practiceMonth = new Date(now.getFullYear(), now.getMonth(), 1); renderPracticeHistory(); });
   }
 
   // ================================================================
@@ -1324,6 +1506,18 @@
       }
     });
     state.history = state.history.slice(-120);
+    // 做题时间按“日期 + 设备”合并；同一设备取较大值，不会因重复同步而翻倍。
+    Object.entries(remoteState.practice || {}).forEach(([day, remoteDevices]) => {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || !remoteDevices || typeof remoteDevices !== "object" || Array.isArray(remoteDevices)) return;
+      state.practice[day] ||= {};
+      Object.entries(remoteDevices).forEach(([deviceId, remoteSeconds]) => {
+        const seconds = Math.max(0, Math.round(Number(remoteSeconds) || 0));
+        state.practice[day][deviceId] = Math.max(Number(state.practice[day][deviceId]) || 0, seconds);
+      });
+    });
+    const practiceDays = Object.keys(state.practice).sort().slice(-400);
+    const practiceKeep = new Set(practiceDays);
+    Object.keys(state.practice).forEach(day => { if (!practiceKeep.has(day)) delete state.practice[day]; });
     if ((remoteState.streak?.current || 0) > (state.streak?.current || 0)) {
       state.streak.current = remoteState.streak.current;
     }
@@ -1617,6 +1811,7 @@
       words: cloneWord(obj.state.words),
       order: Array.isArray(obj.state.order) ? obj.state.order.filter(k => safeWordKey(k) && obj.state.words[k]) : Object.keys(obj.state.words),
       history: Array.isArray(obj.state.history) ? obj.state.history : [],
+      practice: obj.state.practice && typeof obj.state.practice === "object" && !Array.isArray(obj.state.practice) ? cloneWord(obj.state.practice) : {},
       streak: obj.state.streak && typeof obj.state.streak === "object" ? obj.state.streak : { current: 0, best: 0, lastDay: null },
       createdAt: Number(obj.state.createdAt) || Date.now(),
       updatedAt: Date.now(),

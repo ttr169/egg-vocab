@@ -73,6 +73,8 @@
     reviewPerRound: 10,
     graduation: "curve",         // "curve" | "5times"
     kanaRatio: 0.5,              // 拼读音（拼写）题占比，默认 50%
+    lesson4: true,               // Lesson 4「まいにち」词库开关
+    newWordsPerDay: 8,           // 每天解锁的新词数
     autoTTS: true,
     ttsRate: 0.9,
     ttsVoice: "ja-JP",
@@ -160,6 +162,95 @@
     persist();
   }
   seedIfEmpty();
+
+  // ─────────── Lesson 4「まいにち」课本进度（按课本顺序逐日解锁） ───────────
+  // 一次塞进 94 个新词会把「待复习」撑爆，这里每天只放行 N 个。
+  // deck / unlockDay 写在每个词上，房间码同步时随之合并。
+  const L4 = window.SEED_LESSON4 || {};
+  const EN_L4 = window.SEED_EN_L4 || {};
+  const L4_TERMS = Object.keys(L4);
+  const l4Today = () => { const d = new Date(); d.setHours(0, 0, 0, 0); return d.getTime(); };
+
+  function syncLesson4() {
+    if (!L4_TERMS.length) return;
+    let changed = false;
+    // 1) 已在词库里的 L4 词（首次注入 / CSV 导入 / 云端同步来的）补齐标记与内容
+    Object.values(state.words).forEach(w => {
+      const s = L4[w.term];
+      if (!s) return;
+      if (w.deck !== "L4") { w.deck = "L4"; changed = true; }
+      if (!w.pos && s.pos) { w.pos = s.pos; changed = true; }
+      if (!w.reading && s.reading) { w.reading = s.reading; changed = true; }
+      if (!w.en && EN_L4[w.term]) { w.en = EN_L4[w.term]; changed = true; }
+      if (s.kanji && !(w.forms && w.forms["漢字"])) {
+        w.forms = w.forms || {}; w.forms["漢字"] = s.kanji; changed = true;
+      }
+      if ((!w.examples || !w.examples.length) && s.examples) {
+        w.examples = s.examples.map(e => ({ en: e.en, cn: e.cn })); changed = true;
+      }
+    });
+    // 2) 开关打开时增量补齐缺失词，绝不覆盖已有进度
+    if (prefs.lesson4) {
+      L4_TERMS.forEach(t => {
+        const key = t.toLowerCase().trim();
+        if (state.words[key]) return;
+        const s = L4[t];
+        const w = newWord(t, s.cn);
+        w.deck = "L4";
+        w.pos = s.pos || "";
+        w.reading = s.reading || "";
+        w.en = EN_L4[t] || "";
+        if (s.kanji) w.forms["漢字"] = s.kanji;
+        w.examples = (s.examples || []).map(e => ({ en: e.en, cn: e.cn }));
+        w.level = -1;
+        w.due = Date.now();
+        state.words[key] = w;
+        state.order.push(key);
+        changed = true;
+      });
+    }
+    if (changed) persist();
+  }
+
+  function l4Active(w) {
+    if (w.deck !== "L4") return true;
+    // 开启：只排入已解锁的词；关闭：保留已学过的，不再放行新词
+    return prefs.lesson4 ? !!w.unlockDay : (w.level >= 0 || !!w.unlockDay);
+  }
+
+  function l4Stats() {
+    let unlocked = 0, started = 0;
+    Object.values(state.words).forEach(w => {
+      if (w.deck !== "L4") return;
+      if (w.unlockDay) unlocked++;
+      if (w.level >= 0 || w.graduated) started++;
+    });
+    return { unlocked, started, total: L4_TERMS.length };
+  }
+
+  function unlockDailyL4() {
+    if (!prefs.lesson4 || !L4_TERMS.length) return;
+    const t = l4Today();
+    // 计数按实际标记实时算，房间码同步合并后两台设备不会重复放行
+    const used = Object.values(state.words)
+      .filter(w => w.deck === "L4" && w.unlockDay === t).length;
+    const quota = Math.max(1, Math.min(30, Number(prefs.newWordsPerDay) || 8));
+    let left = quota - used;
+    if (left <= 0) return;
+    let changed = false;
+    for (const key of state.order) {
+      const w = state.words[key];
+      if (!w || w.deck !== "L4" || w.unlockDay || w.level >= 0 || w.graduated) continue;
+      w.unlockDay = t;
+      w.due = Date.now();
+      changed = true;
+      if (--left <= 0) break;
+    }
+    if (changed) persist();
+  }
+
+  syncLesson4();
+  unlockDailyL4();
 
   // 英语释义迁移：已有进度数据自动补 en 字段（一次性）
   (function migrateEn() {
@@ -321,7 +412,7 @@
   function dueWords(limit) {
     const now = Date.now();
     return Object.values(state.words)
-      .filter(w => !w.graduated && (w.level < 0 || (w.due && w.due <= now)))
+      .filter(w => !w.graduated && l4Active(w) && (w.level < 0 || (w.due && w.due <= now)))
       .sort((a, b) => (a.due || 0) - (b.due || 0))
       .slice(0, limit || prefs.reviewPerRound);
   }
@@ -552,10 +643,13 @@
     else list.sort((a, b) => a.term.localeCompare(b.term, "ja"));
 
     grid.innerHTML = list.map(w => {
+      const lockedL4 = w.deck === "L4" && !w.unlockDay && w.level < 0 && !w.graduated;
       const isDue = !w.graduated && (w.level < 0 || (w.due && w.due <= Date.now()));
       const badge = w.graduated ? '<span class="lv-badge grad">🎓 毕业</span>'
-        : (w.level < 0 ? '<span class="lv-badge">新词</span>' : `<span class="lv-badge">Lv.${w.level + 1}</span>`);
+        : (lockedL4 ? '<span class="lv-badge">🔒 待解锁</span>'
+        : (w.level < 0 ? '<span class="lv-badge">新词</span>' : `<span class="lv-badge">Lv.${w.level + 1}</span>`));
       const dueTag = w.graduated ? '<span class="due-tag done">已掌握</span>'
+        : lockedL4 ? '<span class="due-tag soon">未解锁</span>'
         : isDue ? '<span class="due-tag">待复习</span>'
         : '<span class="due-tag soon">' + fmtDue(w.due) + '</span>';
       return `
@@ -1275,6 +1369,20 @@
       </div>
 
       <div class="card">
+        <div class="card-head"><h2>课本进度 · Lesson 4</h2><span class="sub">まいにち / Everyday Life</span></div>
+        <label class="row" style="gap:8px;font-size:13px;color:var(--ink-soft)">
+          <input type="checkbox" id="lesson4Chk" ${prefs.lesson4 ? "checked" : ""}/> 启用 Lesson 4 词库（94 词，按课本顺序逐日解锁）
+        </label>
+        <div class="field" style="margin-top:10px">
+          <label>每天解锁新词数（1–30）</label>
+          <input type="number" id="newPerDayInp" min="1" max="30" value="${prefs.newWordsPerDay}"/>
+        </div>
+        <p class="muted" style="margin-top:6px">${(function () { const s = l4Stats(); return "已解锁 <b>" + s.unlocked + "</b> / " + s.total + " 词，已开始学习 <b>" + s.started + "</b> 词。关闭开关不会删除已学进度。"; })()}</p>
+        <button class="btn btn-mint" id="applyL4Btn" style="margin-top:10px">应用课本设置</button>
+        <p class="muted" style="margin-top:8px">词条、读音、汉字、中英释义与例句均内置；这批词暂无真人配音，会自动使用设备自带日语朗读。</p>
+      </div>
+
+      <div class="card">
         <div class="card-head"><h2>复习设置</h2></div>
         <div class="row">
           <div class="field" style="flex:1">
@@ -1326,7 +1434,7 @@
           <button class="btn btn-lav" id="testApiBtn">测试接口连通性</button>
           <button class="btn btn-egg" id="fillCnBtn">补全缺失的中文释义</button>
         </div>
-        <p class="muted" style="margin-top:8px">内置种子库已含 ${Object.keys(SEED).length} 个常见词的真人例句，离线可用。</p>
+        <p class="muted" style="margin-top:8px">内置课本词库共 ${Object.keys(SEED).length} 词（Lesson 3 部分词条带真人配音），离线可用。</p>
       </div>
 
       <div class="card">
@@ -1396,6 +1504,18 @@
       await syncPull();
     });
 
+    // 课本进度 · Lesson 4
+    $("#applyL4Btn").addEventListener("click", () => {
+      prefs.lesson4 = $("#lesson4Chk").checked;
+      prefs.newWordsPerDay = Math.max(1, Math.min(30, parseInt($("#newPerDayInp").value, 10) || 8));
+      persistPrefs();
+      syncLesson4();
+      unlockDailyL4();
+      toast(prefs.lesson4 ? "Lesson 4 已启用，今日新词已解锁" : "Lesson 4 已暂停，已学进度保留", "gold");
+      updateBadges();
+      render();
+    });
+
     // 复习设置
     $("#savePrefsBtn").addEventListener("click", () => {
       prefs.reviewPerRound = parseInt($("#roundInp").value, 10) || 10;
@@ -1404,9 +1524,13 @@
       prefs.kanaRatio = parseFloat($("#kanaRatioSel").value);
       prefs.ttsRate = parseFloat($("#rateInp").value) || 0.95;
       prefs.autoTTS = $("#autoTTS").checked;
+      if ($("#lesson4Chk")) prefs.lesson4 = $("#lesson4Chk").checked;
+      if ($("#newPerDayInp")) prefs.newWordsPerDay = Math.max(1, Math.min(30, parseInt($("#newPerDayInp").value, 10) || 8));
       prefs.apiTranslate = $("#apiTrInp").value.trim();
       prefs.apiExamples = $("#apiExInp").value.trim();
       persistPrefs();
+      syncLesson4();
+      unlockDailyL4();
       toast("已保存设置", "gold");
       updateBadges();
     });
@@ -1463,12 +1587,12 @@
   function wordTime(w, field) { return Number.isFinite(Number(w?.[field])) ? Number(w[field]) : 0; }
   function cloneWord(w) { return JSON.parse(JSON.stringify(w)); }
   function copyProgress(target, source) {
-    ["level", "graduated", "due", "correct", "lapses", "totalReviews", "reviewedAt", "updatedAt"].forEach(k => {
+    ["level", "graduated", "due", "correct", "lapses", "totalReviews", "reviewedAt", "updatedAt", "deck", "unlockDay"].forEach(k => {
       if (Object.prototype.hasOwnProperty.call(source, k)) target[k] = source[k];
     });
   }
   function copyContent(target, source) {
-    ["term", "cn", "en", "pos", "reading", "forms", "examples", "contentUpdatedAt"].forEach(k => {
+    ["term", "cn", "en", "pos", "reading", "forms", "examples", "contentUpdatedAt", "deck", "unlockDay"].forEach(k => {
       if (Object.prototype.hasOwnProperty.call(source, k)) target[k] = cloneWord(source[k]);
     });
   }
@@ -1495,6 +1619,8 @@
       }
       // 释义等内容独立按最后编辑时间合并，不会被一次普通复习误覆盖。
       if (wordTime(rw, "contentUpdatedAt") > wordTime(lw, "contentUpdatedAt")) copyContent(lw, rw);
+      // 解锁标记：两边只要有一边解锁过就算已解锁（进度分数相同时也要合并）
+      if (!lw.unlockDay && rw.unlockDay) { lw.unlockDay = rw.unlockDay; updated++; }
     });
     // 学习历史按日期合并（取较大值）
     (remoteState.history || []).forEach(rh => {
@@ -1521,11 +1647,13 @@
     if ((remoteState.streak?.current || 0) > (state.streak?.current || 0)) {
       state.streak.current = remoteState.streak.current;
     }
+    syncLesson4();   // 云端带回来的新词补齐 deck / 读音 / 例句
     return { added, updated };
   }
   function syncPayload() {
     return { type: "eggy-vocab", v: 2, at: Date.now(), state,
-      prefs: { dailyGoal: prefs.dailyGoal, reviewPerRound: prefs.reviewPerRound, graduation: prefs.graduation } };
+      prefs: { dailyGoal: prefs.dailyGoal, reviewPerRound: prefs.reviewPerRound, graduation: prefs.graduation,
+               lesson4: prefs.lesson4, newWordsPerDay: prefs.newWordsPerDay } };
   }
 
   // ─────────── 房间码云同步 (textdb.dev，免登录、CORS 已实测可用) ───────────

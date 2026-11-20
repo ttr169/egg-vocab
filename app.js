@@ -78,6 +78,10 @@
     ois: true,                   // OIS 基础词库开关
     oisPerDay: 8,                // OIS 每天解锁新词数
     retention: 0.85,             // FSRS 目标保留率
+    grammar: true,               // 语法句型开关
+    gPerDay: 3,                  // 每天解锁语法句型数
+    dailyMinutes: 15,            // 每日总时长（分钟）
+    wordRatio: 2,                // 单词:语法 时间比
     autoTTS: true,
     ttsRate: 0.9,
     ttsVoice: "ja-JP",
@@ -514,6 +518,84 @@
       .slice(0, limit || prefs.reviewPerRound);
   }
 
+  // ─────────── 语法句型队列（独立 FSRS 调度） ───────────
+  const GRAMMAR = window.SEED_GRAMMAR || {};
+  const G_KEYS = Object.keys(GRAMMAR);
+
+  function syncGrammar() {
+    if (!state.grammar || typeof state.grammar !== "object") state.grammar = {};
+    let changed = false;
+    G_KEYS.forEach(id => {
+      if (!state.grammar[id]) {
+        state.grammar[id] = {
+          id, due: 0, fsrsReps: 0, fsrsS: 0, fsrsD: 5, fsrsLast: 0,
+          unlockDay: 0, totalReviews: 0, correct: 0, lapses: 0
+        };
+        changed = true;
+      }
+    });
+    if (changed) persist();
+  }
+
+  function unlockDailyGrammar() {
+    if (!prefs.grammar || !G_KEYS.length) return;
+    const t = oisToday();
+    const quota = Math.max(1, Math.min(10, Number(prefs.gPerDay) || 3));
+    const used = Object.values(state.grammar).filter(g => g.unlockDay === t).length;
+    let left = quota - used;
+    if (left <= 0) return;
+    let changed = false;
+    for (const id of G_KEYS) {
+      const g = state.grammar[id];
+      if (!g || g.unlockDay || g.fsrsReps > 0) continue;
+      g.unlockDay = t;
+      g.due = Date.now();
+      changed = true;
+      if (--left <= 0) break;
+    }
+    if (changed) persist();
+  }
+
+  function grammarDue(limit) {
+    const now = Date.now();
+    return G_KEYS.map(id => state.grammar[id])
+      .filter(g => g && g.unlockDay && (!g.due || g.due <= now))
+      .sort((a, b) => (a.due || 0) - (b.due || 0))
+      .slice(0, limit || prefs.reviewPerRound)
+      .map(g => Object.assign({}, GRAMMAR[g.id], g));
+  }
+
+  function grammarStats() {
+    let unlocked = 0, started = 0;
+    G_KEYS.forEach(id => {
+      const g = state.grammar[id];
+      if (!g) return;
+      if (g.unlockDay) unlocked++;
+      if (g.fsrsReps > 0) started++;
+    });
+    return { unlocked, started, total: G_KEYS.length };
+  }
+
+  function fmtSpent(sec) {
+    sec = Math.max(0, Math.round(sec || 0));
+    return Math.floor(sec / 60) + ":" + String(sec % 60).padStart(2, "0");
+  }
+
+  function targetMinutes() {
+    const total = Math.max(5, Math.min(120, Number(prefs.dailyMinutes) || 15));
+    const wr = Math.max(1, Math.min(4, Number(prefs.wordRatio) || 2));
+    const word = Math.round(total * wr / (wr + 1));
+    return { word, gram: Math.max(1, Math.round(total - word)) };
+  }
+
+  function todayStats() {
+    const tk = todayKey();
+    if (!state.studyTime || state.studyTime.day !== tk) {
+      state.studyTime = { day: tk, word: 0, gram: 0 };
+    }
+    return state.studyTime;
+  }
+
   function reviewCount() { return dueWords(99999).length; }
   function graduatedList() { return Object.values(state.words).filter(w => w.graduated); }
 
@@ -527,6 +609,9 @@
     else { state.streak = { current: 1, best: Math.max(state.streak.best, 1), lastDay: t }; }
     persist();
   }
+
+  syncGrammar();
+  unlockDailyGrammar();
 
   // ─────────── 路由 ───────────
   let currentTab = "words";
@@ -590,7 +675,7 @@
 
   function render() {
     updateBadges();
-    if (session && !session.done) return renderStudy();
+    if (session && !session.done) return session.kind === "grammar" ? renderGrammarStudy() : renderStudy();
     if (session && session.done) return renderComplete();
     switch (currentTab) {
       case "words":     return renderWords();
@@ -779,33 +864,44 @@
   // ================================================================
   function renderReview() {
     const due = dueWords(prefs.reviewPerRound);
-    if (due.length === 0) {
-      root.innerHTML = `
-        <div class="card empty">
-          <span class="egg">🥚</span>
-          <h2 style="margin:6px 0">暂无需要复习的单词</h2>
-          <p class="muted">去「单词」页添加新词，或等一会儿艾宾浩斯曲线会安排到期复习。</p>
-          <button class="btn btn-pink" id="goAddBtn">去添加单词</button>
-        </div>`;
-      $("#goAddBtn").addEventListener("click", () => setTab("words"));
-      return;
-    }
+    const gdue = grammarDue(999);
+    const st = todayStats();
+    const tgt = targetMinutes();
+    const wPct = Math.min(100, Math.round(st.word / Math.max(1, tgt.word * 60) * 100));
+    const gPct = Math.min(100, Math.round(st.gram / Math.max(1, tgt.gram * 60) * 100));
+    const gs = grammarStats();
+    const newCount = Object.values(state.words).filter(w => w.level < 0 && oisActive(w) && l4Active(w)).length;
     root.innerHTML = `
-      <div class="card" style="text-align:center">
-        <div class="card-head"><h2>开始复习</h2><span class="sub">${due.length} 词 · 本轮</span></div>
-        <p class="muted">答对升 1 级、答错降 2 级。完成 30 天后的最终复习才毕业 🎓</p>
-        <p class="muted" style="margin-bottom:14px">今日做题时间：${formatPracticeTime(practiceSecondsForDate(localDateKey()), true)} / 15 分钟</p>
-        <button class="btn btn-pink lg" id="startBtn">开始复习 →</button>
+      <div class="card">
+        <div class="card-head"><h2>今日学习</h2><span class="sub">${prefs.dailyMinutes} 分钟 · 单词 ${tgt.word} : 语法 ${tgt.gram}</span></div>
+        <div style="border:1px solid #e5e7eb;border-radius:12px;padding:14px;margin-bottom:12px">
+          <div style="display:flex;justify-content:space-between;margin-bottom:8px">
+            <b>单词</b><span class="muted">${fmtSpent(st.word)} / ${tgt.word} 分钟</span>
+          </div>
+          <div style="height:8px;background:#eef1f5;border-radius:999px;overflow:hidden">
+            <i style="display:block;height:100%;width:${wPct}%;background:#f472b6"></i>
+          </div>
+          <p class="muted" style="margin:8px 0">待复习 ${due.length} 词 · 待解锁新词 ${newCount}</p>
+          <button class="btn btn-pink" id="startWordsBtn">开始单词 →</button>
+        </div>
+        <div style="border:1px solid #e5e7eb;border-radius:12px;padding:14px">
+          <div style="display:flex;justify-content:space-between;margin-bottom:8px">
+            <b>语法</b><span class="muted">${fmtSpent(st.gram)} / ${tgt.gram} 分钟</span>
+          </div>
+          <div style="height:8px;background:#eef1f5;border-radius:999px;overflow:hidden">
+            <i style="display:block;height:100%;width:${gPct}%;background:#34d399"></i>
+          </div>
+          <p class="muted" style="margin:8px 0">待复习 ${gdue.length} 条句型 · 已解锁 ${gs.unlocked} / ${gs.total}</p>
+          <button class="btn btn-mint" id="startGrammarBtn">开始语法 →</button>
+        </div>
       </div>
       <div class="card">
-        <div class="card-head"><h2>艾宾浩斯曲线</h2></div>
-        <table class="ebb-table">
-          <tr><th>复习</th><th>间隔</th><th>说明</th></tr>
-          ${EBB.map(e => `<tr class="${e.level===0?'cur':''}"><td>${e.label}</td><td>${e.hint}</td><td>${ebbDesc(e.level)}</td></tr>`).join("")}
-          <tr><td><b>30 天后答对</b></td><td>🎓</td><td>毕业，进入长期记忆</td></tr>
-        </table>
+        <div class="card-head"><h2>FSRS 调度</h2><span class="sub">每个词单独排期</span></div>
+        <p class="muted">答错 10 分钟后重来；秒答且对则间隔跳远。目标保留率 ${Math.round((prefs.retention || 0.85) * 100)}%。</p>
+        <p class="muted">单词按组块学习，语法才做交错练习（研究显示词汇交错有负效应）。</p>
       </div>`;
-    $("#startBtn").addEventListener("click", startSession);
+    $("#startWordsBtn").addEventListener("click", () => startSession("word"));
+    $("#startGrammarBtn").addEventListener("click", () => startSession("grammar"));
   }
 
   function ebbDesc(i) {
@@ -813,16 +909,24 @@
     return map[i] || "";
   }
 
-  function startSession() {
+  function startSession(kind) {
+    kind = kind || "word";
+    const queue = kind === "grammar" ? grammarDue(prefs.reviewPerRound) : dueWords(prefs.reviewPerRound);
     session = {
-      queue: dueWords(prefs.reviewPerRound),
+      kind,
+      queue,
       idx: 0,
       results: [],
       startTime: Date.now(),
       practiceSeconds: 0,
       done: false
     };
-    if (session.queue.length === 0) { session = null; toast("暂无待复习", "gold"); setTab("review"); return; }
+    if (queue.length === 0) {
+      session = null;
+      toast(kind === "grammar" ? "暂无到期的语法句型" : "暂无待复习", "gold");
+      setTab("review");
+      return;
+    }
     bumpStreak();
     render();
   }
@@ -856,6 +960,156 @@
       setTab("review");
     });
     mountMode(mode, w);
+  }
+
+  // ─────────── 语法学习引擎 ───────────
+  function grammarLabel(m) {
+    return { gcard: "句型卡", gfill: "接续填空", gmeaning: "用法配对" }[m] || "语法";
+  }
+
+  function pickGrammarMode(g) {
+    if (!g.fsrsReps) return "gcard";
+    return g.fillable ? (Math.random() < 0.65 ? "gfill" : "gmeaning") : "gmeaning";
+  }
+
+  function renderGrammarStudy() {
+    const g = session.queue[session.idx];
+    if (!g) { finishSession(); return; }
+    const mode = pickGrammarMode(g);
+    const lv = g.fsrsReps ? Math.min(8, Math.floor(Math.log(Math.max(1, g.fsrsS)) / Math.log(2))) + 1 : 0;
+    root.innerHTML = `
+      <div class="dots-row">
+        <div class="dots">${session.queue.map((_, i) =>
+          `<span class="dot ${i < session.idx ? "done" : ""} ${i === session.idx ? "active" : ""}"></span>`).join("")}
+        </div>
+        <button class="quit-btn" id="quitBtn">✕ 退出</button>
+      </div>
+      <div class="study-card" id="studyCard">
+        <span class="tag">${grammarLabel(mode)}</span>
+        <span class="lvl">${lv ? "Lv." + lv : "新句型"}</span>
+        <div id="studyBody"></div>
+      </div>`;
+    beginQuestionTiming();
+    $("#quitBtn").addEventListener("click", () => {
+      if (!confirm("语法还没做完，确定退出？")) return;
+      questionTimer = null;
+      session = null;
+      setTab("review");
+    });
+    mountGrammarMode(mode, g);
+  }
+
+  function mountGrammarMode(mode, g) {
+    const body = $("#studyBody");
+    if (mode === "gcard") return mountGrammarCard(body, g);
+    if (mode === "gfill") return mountGrammarFill(body, g);
+    return mountGrammarMeaning(body, g);
+  }
+
+  function mountGrammarCard(body, g) {
+    const ex = (g.examples && g.examples[0]) || { en: "", cn: "" };
+    body.innerHTML = `
+      <div style="font-size:13px;color:#6b7280;margin-bottom:6px">${esc(g.chapter)}</div>
+      <div class="big" style="font-size:20px;line-height:1.5">${esc(g.pattern)}</div>
+      <div class="sub" style="margin:10px 0">${esc(g.meaning)}</div>
+      <div style="background:#fafbfc;border:1px solid #e5e7eb;border-radius:10px;padding:12px;margin:10px 0">
+        <div style="font-size:16px">${esc(ex.en)}</div>
+        <div class="muted" style="font-size:13px;margin-top:4px">${esc(ex.cn)}</div>
+      </div>
+      <div class="row" style="justify-content:center;gap:10px;margin-top:8px">
+        <button class="btn btn-ghost" id="gAgain">没记住</button>
+        <button class="btn btn-mint" id="gGood">记住了</button>
+      </div>`;
+    if (prefs.autoTTS && ex.en) setTimeout(() => speak(ex.en), 250);
+    $("#gAgain", body).addEventListener("click", () => gradeGrammar(g, false, "gcard"));
+    $("#gGood", body).addEventListener("click", () => gradeGrammar(g, true, "gcard"));
+  }
+
+  function mountGrammarFill(body, g) {
+    const key = g.key;
+    const picked = (g.examples || []).find(x => x.en && (x.en.indexOf(key) >= 0 || x.en.indexOf(key.replace("/", "／")) >= 0));
+    if (!picked) return mountGrammarMeaning(body, g);
+    const rawKey = picked.en.indexOf(key) >= 0 ? key : key.replace("/", "／");
+    const blanked = picked.en.replace(rawKey, "＿＿＿");
+    const pool = G_KEYS.map(id => GRAMMAR[id])
+      .filter(x => x.fillable && x.key && x.key !== key).map(x => x.key);
+    const opts = shuffle([key].concat(shuffle(pool).slice(0, 3)));
+    body.innerHTML = `
+      <div style="font-size:13px;color:#6b7280;margin-bottom:6px">${esc(g.meaning)}</div>
+      <div class="big" style="font-size:19px;line-height:1.8">${esc(blanked)}</div>
+      <div class="muted" style="margin:6px 0 12px">${esc(picked.cn)}</div>
+      <div class="choices">
+        ${opts.map(o => `<button class="choice" data-v="${esc(o)}">${esc(o)}</button>`).join("")}
+      </div>`;
+    let done = false;
+    $$(".choice", body).forEach(btn => btn.addEventListener("click", () => {
+      if (done) return;
+      done = true;
+      recordAnsweredQuestion();
+      const ok = btn.dataset.v === key;
+      $$(".choice", body).forEach(b => {
+        b.disabled = true;
+        if (b.dataset.v === key) b.classList.add("right");
+        else if (b === btn) b.classList.add("wrong");
+      });
+      if (prefs.autoTTS) speak(picked.en);
+      addGrammarNext(body, g, ok, "gfill");
+    }));
+  }
+
+  function mountGrammarMeaning(body, g) {
+    const pool = G_KEYS.map(id => GRAMMAR[id]).filter(x => x.pattern !== g.pattern).map(x => x.pattern);
+    const opts = shuffle([g.pattern].concat(shuffle(pool).slice(0, 3)));
+    body.innerHTML = `
+      <div class="big" style="font-size:18px;line-height:1.5">${esc(g.meaning)}</div>
+      <div class="muted" style="margin:8px 0 14px">选出对应的句型</div>
+      <div class="choices">
+        ${opts.map(o => `<button class="choice" data-v="${esc(o)}" style="font-size:14px">${esc(o)}</button>`).join("")}
+      </div>`;
+    let done = false;
+    $$(".choice", body).forEach(btn => btn.addEventListener("click", () => {
+      if (done) return;
+      done = true;
+      recordAnsweredQuestion();
+      const ok = btn.dataset.v === g.pattern;
+      $$(".choice", body).forEach(b => {
+        b.disabled = true;
+        if (b.dataset.v === g.pattern) b.classList.add("right");
+        else if (b === btn) b.classList.add("wrong");
+      });
+      addGrammarNext(body, g, ok, "gmeaning");
+    }));
+  }
+
+  function addGrammarNext(body, g, correct, mode) {
+    const row = document.createElement("div");
+    row.className = "next-row";
+    row.innerHTML = `
+      <span class="next-verdict ${correct ? "good" : "bad"}">${correct ? "🎉 对了" : "❌ 正确答案：" + esc(g.key || g.pattern)}</span>
+      <button class="btn btn-pink" id="gNext">下一题 →</button>`;
+    body.appendChild(row);
+    $("#gNext", body).addEventListener("click", () => gradeGrammar(g, correct, mode));
+  }
+
+  function gradeGrammar(g, correct, mode) {
+    const rtMs = questionTimer
+      ? questionTimer.activeMs + (questionTimer.visibleSince ? Date.now() - questionTimer.visibleSince : 0)
+      : 0;
+    recordAnsweredQuestion();
+    const st = todayStats();
+    st.gram += Math.min(180, Math.round(rtMs / 1000));
+    const rec = state.grammar[g.id];
+    if (rec) {
+      rec.totalReviews = (rec.totalReviews || 0) + 1;
+      if (correct) rec.correct = (rec.correct || 0) + 1; else rec.lapses = (rec.lapses || 0) + 1;
+      const grade = window.FSRS ? FSRS.autoGrade(correct, rtMs, false) : (correct ? 3 : 1);
+      if (window.FSRS) FSRS.update(rec, grade, Date.now(), prefs.retention);
+      persist();
+    }
+    session.results.push({ key: g.id, correct, mode });
+    session.idx++;
+    if (session.idx >= session.queue.length) finishSession();
+    else render();
   }
 
   function pickMode(w) {
@@ -1100,6 +1354,9 @@
       ? questionTimer.activeMs + (questionTimer.visibleSince ? Date.now() - questionTimer.visibleSince : 0)
       : 0;
     recordAnsweredQuestion();
+    const st = todayStats();
+    const spent = Math.min(180, Math.round(rtMs / 1000));
+    if (session.kind === "grammar") st.gram += spent; else st.word += spent;
     scheduleNext(w, correct, rtMs, false);
     session.results.push({ key: w.key, correct, mode });
     session.idx++;
@@ -1156,8 +1413,8 @@
           <button class="btn btn-ghost" id="backBtn">回到首页</button>
         </div>
       </div>`;
-    $("#againBtn").addEventListener("click", () => { session = null; startSession(); });
-    $("#backBtn").addEventListener("click", () => { session = null; setTab("words"); });
+    $("#againBtn").addEventListener("click", () => { const k = session.kind; session = null; startSession(k); });
+    $("#backBtn").addEventListener("click", () => { session = null; setTab("review"); });
   }
 
   // ================================================================
@@ -1527,11 +1784,25 @@
         <div class="card-head"><h2>复习设置</h2></div>
         <div class="row">
           <div class="field" style="flex:1">
-            <label>每轮复习量</label>
+            <label>每日学习时长（分钟）</label>
+            <input type="number" id="minutesInp" min="5" max="120" value="${prefs.dailyMinutes}"/>
+          </div>
+          <div class="field" style="flex:1">
+            <label>单词 : 语法</label>
+            <select id="ratioSel">
+              <option value="2" ${Number(prefs.wordRatio) !== 1 && Number(prefs.wordRatio) !== 3 ? "selected" : ""}>2 : 1（推荐）</option>
+              <option value="1" ${Number(prefs.wordRatio) === 1 ? "selected" : ""}>1 : 1</option>
+              <option value="3" ${Number(prefs.wordRatio) === 3 ? "selected" : ""}>3 : 1</option>
+            </select>
+          </div>
+        </div>
+        <div class="row">
+          <div class="field" style="flex:1">
+            <label>每轮题量</label>
             <input type="number" id="roundInp" min="5" max="100" value="${prefs.reviewPerRound}"/>
           </div>
           <div class="field" style="flex:1">
-            <label>每日目标 (保留题数)</label>
+            <label>每日题数上限</label>
             <input type="number" id="goalInp" min="5" max="200" value="${prefs.dailyGoal}"/>
           </div>
         </div>
@@ -1673,6 +1944,8 @@
 
     // 复习设置
     $("#savePrefsBtn").addEventListener("click", () => {
+      if ($("#minutesInp")) prefs.dailyMinutes = Math.max(5, Math.min(120, parseInt($("#minutesInp").value, 10) || 15));
+      if ($("#ratioSel")) prefs.wordRatio = parseFloat($("#ratioSel").value) || 2;
       prefs.reviewPerRound = parseInt($("#roundInp").value, 10) || 10;
       prefs.dailyGoal = parseInt($("#goalInp").value, 10) || 20;
       prefs.retention = parseFloat($("#retentionSel").value) || 0.85;

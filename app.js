@@ -75,6 +75,9 @@
     kanaRatio: 0.5,              // 拼读音（拼写）题占比，默认 50%
     lesson4: true,               // Lesson 4「まいにち」词库开关
     newWordsPerDay: 8,           // 每天解锁的新词数
+    ois: true,                   // OIS 基础词库开关
+    oisPerDay: 8,                // OIS 每天解锁新词数
+    retention: 0.85,             // FSRS 目标保留率
     autoTTS: true,
     ttsRate: 0.9,
     ttsVoice: "ja-JP",
@@ -252,6 +255,113 @@
   syncLesson4();
   unlockDailyL4();
 
+  // ─────────── OIS Basic Vocabulary（按组逐日解锁） ───────────
+  const OIS = window.SEED_OIS || {};
+  const OIS_TERMS = Object.keys(OIS);
+  const oisToday = () => { const d = new Date(); d.setHours(0, 0, 0, 0); return d.getTime(); };
+
+  function syncOIS() {
+    if (!OIS_TERMS.length) return;
+    let changed = false;
+    Object.values(state.words).forEach(w => {
+      const s = OIS[w.term];
+      if (!s) return;
+      if (w.deck !== "OIS") { w.deck = "OIS"; changed = true; }
+      if (!w.en && s.en) { w.en = s.en; changed = true; }
+      if (s.kanji && !(w.forms && w.forms["漢字"])) {
+        w.forms = w.forms || {}; w.forms["漢字"] = s.kanji; changed = true;
+      }
+      if ((!w.examples || !w.examples.length) && s.examples) {
+        w.examples = s.examples.map(e => ({ en: e.en, cn: e.cn })); changed = true;
+      }
+    });
+    if (prefs.ois) {
+      OIS_TERMS.forEach(t => {
+        const key = t.toLowerCase().trim();
+        if (state.words[key]) return;
+        const s = OIS[t];
+        const w = newWord(t, s.cn);
+        w.deck = "OIS";
+        w.pos = s.pos || "";
+        w.reading = s.reading || "";
+        w.en = s.en || "";
+        if (s.kanji) w.forms["漢字"] = s.kanji;
+        w.examples = (s.examples || []).map(e => ({ en: e.en, cn: e.cn }));
+        w.level = -1;
+        w.due = Date.now();
+        w.fsrsReps = 0;
+        w.fsrsS = 0;
+        w.fsrsD = 5;
+        state.words[key] = w;
+        state.order.push(key);
+        changed = true;
+      });
+    }
+    if (changed) persist();
+  }
+
+  function oisActive(w) {
+    if (w.deck !== "OIS") return true;
+    return prefs.ois ? !!w.unlockDay : (w.level >= 0 || !!w.unlockDay);
+  }
+
+  function oisStats() {
+    let unlocked = 0, started = 0;
+    Object.values(state.words).forEach(w => {
+      if (w.deck !== "OIS") return;
+      if (w.unlockDay) unlocked++;
+      if (w.level >= 0 || w.graduated) started++;
+    });
+    return { unlocked, started, total: OIS_TERMS.length };
+  }
+
+  function unlockDailyOIS() {
+    if (!prefs.ois || !OIS_TERMS.length) return;
+    const t = oisToday();
+    const used = Object.values(state.words)
+      .filter(w => w.deck === "OIS" && w.unlockDay === t).length;
+    const quota = Math.max(1, Math.min(50, Number(prefs.oisPerDay) || 8));
+    let left = quota - used;
+    if (left <= 0) return;
+    let changed = false;
+    for (const key of state.order) {
+      const w = state.words[key];
+      if (!w || w.deck !== "OIS" || w.unlockDay || w.level >= 0 || w.graduated) continue;
+      w.unlockDay = t;
+      w.due = Date.now();
+      changed = true;
+      if (--left <= 0) break;
+    }
+    if (changed) persist();
+  }
+
+  // ─────────── 旧进度迁移到 FSRS ───────────
+  function migrateToFSRS() {
+    const now = Date.now();
+    const S_MAP = [0.4, 1.2, 3.1, 7.2, 15.5, 30, 60, 120, 240];
+    let n = 0;
+    Object.values(state.words).forEach(w => {
+      if (w.fsrsReps !== undefined) return;
+      if (w.level < 0 && !w.graduated) {
+        w.fsrsReps = 0; w.fsrsS = 0; w.fsrsD = 5; w.fsrsLast = now;
+      } else if (w.graduated) {
+        w.fsrsS = 365; w.fsrsD = 4; w.fsrsReps = 5;
+        w.fsrsLast = w.reviewedAt || now;
+        w.due = now + 180 * DAY_MS;   // 毕业词 180 天后抽查
+      } else {
+        const lv = Math.max(0, Math.min(8, w.level || 0));
+        w.fsrsS = S_MAP[lv]; w.fsrsD = 5; w.fsrsReps = lv + 1;
+        w.fsrsLast = w.reviewedAt || now;
+      }
+      n++;
+    });
+    if (n) persist();
+  }
+
+  syncOIS();
+  unlockDailyOIS();
+  migrateToFSRS();
+
   // 英语释义迁移：已有进度数据自动补 en 字段（一次性）
   (function migrateEn() {
     let n = 0;
@@ -381,38 +491,25 @@
     if (w.level < 0) return w.due; // 未开始
     return w.due;
   }
-  function scheduleNext(w, correct) {
+  // FSRS-5 调度：按稳定性/难度/可提取性算下次复习，不再查固定间隔表
+  function scheduleNext(w, correct, rtMs, usedHint) {
     const now = Date.now();
     w.totalReviews++;
     w.reviewedAt = now;
     w.updatedAt = now;
-    if (correct) {
-      w.correct++;
-      // 完成第 9 档的 30 天复习后才毕业。旧逻辑在排到 30 天前就毕业了。
-      if (w.level >= GRAD_LEVEL - 1 && prefs.graduation === "curve") {
-        w.graduated = true;
-        w.due = null;
-      } else if (prefs.graduation === "5times" && w.correct >= 5) {
-        w.graduated = true;
-        w.due = null;
-      } else {
-        w.level = Math.min(GRAD_LEVEL - 1, w.level + 1);
-        const idx = Math.max(0, w.level);
-        w.due = now + EBB[Math.min(idx, EBB.length - 1)].interval;
-      }
-    } else {
-      w.lapses++;
-      w.level = Math.max(-1, w.level - 2); // 倒退 2 级
-      // 立刻重来：30 秒后再次出现
-      w.due = now + 30 * 1000;
-    }
+    if (correct) w.correct++; else w.lapses++;
+    const g = (window.FSRS && FSRS.autoGrade)
+      ? FSRS.autoGrade(correct, rtMs, usedHint)
+      : (correct ? 3 : 1);
+    w.lastGrade = g;
+    if (window.FSRS) FSRS.update(w, g, now, prefs.retention);
     persist();
   }
 
   function dueWords(limit) {
     const now = Date.now();
     return Object.values(state.words)
-      .filter(w => !w.graduated && l4Active(w) && (w.level < 0 || (w.due && w.due <= now)))
+      .filter(w => l4Active(w) && oisActive(w) && (w.level < 0 || (w.due && w.due <= now)))
       .sort((a, b) => (a.due || 0) - (b.due || 0))
       .slice(0, limit || prefs.reviewPerRound);
   }
@@ -762,23 +859,22 @@
   }
 
   function pickMode(w) {
-    const r = Math.random();
-    // 拼读音（日语特有的拼写测试）：默认占一半 —— 点击五十音拼出读音，最练拼写
-    let ratio = (typeof prefs.kanaRatio === "number") ? prefs.kanaRatio : 0.5;
-    ratio = Math.min(0.9, Math.max(0, ratio));
-    // 读音过长的词（>9 个假名，如 ちゅうがくいちねんせい）不出拼写题，避免孩子受挫；改用其他题型
-    const len = ((w && w.term) || "").replace(/[～~]/g, "").length;
+    const reps = w.fsrsReps || 0;
+    // 新词：先用翻卡/听力建立第一印象，不出产出题
+    if (reps === 0) return Math.random() < 0.55 ? "flashcard" : "listening";
+    const len = (w.term || "").replace(/[～~]/g, "").length;
     const canSpell = len > 0 && len <= 9;
-    if (canSpell && r < ratio) return "kana";
-    // 剩余部分在 翻卡 / 日→中 / 中→日 / 听力 之间分配
-    const rest = (r - (canSpell ? ratio : 0)) / Math.max(0.0001, 1 - (canSpell ? ratio : 0));
-    if (rest < 0.22) return "flashcard";
-    if (rest < 0.55) return "en2cn";      // 看日语选中文
-    if (rest < 0.85) return "cn2en";      // 看中文选日语
-    return "listening";                   // 听音选
+    const hasCloze = !!(w.examples && w.examples[0] && w.examples[0].en);
+    // 复习阶段只出「提取型」题：例句挖空 / 听写 / 无提示拼写
+    const pool = [];
+    if (hasCloze) pool.push("cloze", "cloze");
+    if (canSpell) pool.push("dictation", "production");
+    if (!pool.length) pool.push(canSpell ? "kana" : "listening", "en2cn");
+    return pool[Math.floor(Math.random() * pool.length)];
   }
   function modeLabel(m) {
-    return { flashcard: "翻卡", en2cn: "日→中", cn2en: "中→日", listening: "听力", kana: "拼读音" }[m];
+    return { flashcard: "翻卡", en2cn: "日→释义", cn2en: "释义→日", listening: "听力",
+             kana: "拼读音", cloze: "例句挖空", dictation: "听写", production: "拼写" }[m];
   }
 
   function mountMode(mode, w) {
@@ -787,7 +883,10 @@
     if (mode === "en2cn") return mountChoice(body, w, "en2cn");
     if (mode === "cn2en") return mountChoice(body, w, "cn2en");
     if (mode === "listening") return mountListening(body, w);
-    if (mode === "kana") return mountKanaBuild(body, w);
+    if (mode === "kana") return mountKanaBuild(body, w, "kana");
+    if (mode === "cloze") return mountKanaBuild(body, w, "cloze");
+    if (mode === "dictation") return mountKanaBuild(body, w, "dictation");
+    if (mode === "production") return mountKanaBuild(body, w, "production");
   }
 
   // 翻卡
@@ -879,18 +978,37 @@
   }
 
   // 拼读音（日语特有考察）：上面显示汉字，下方点击五十音图按键拼出正确读音
-  function mountKanaBuild(body, w) {
+  function mountKanaBuild(body, w, variant) {
     // 「～」是助词/后缀标记，不参与拼写，只拼假名部分（如 ぎりの～ → 拼 ぎりの）
     const answer = (w.term || "").replace(/[～~]/g, "");
     const kanji = (w.forms && (w.forms["漢字"] || w.forms["汉字"])) || "";
-    // 有汉字写法 → 大字显示汉字；纯假名词（如 かぞく）→ 显示释义，绝不显示答案本身
     const hasKanji = kanji && kanji !== answer;
-    const promptBig = hasKanji
-      ? `<div class="big" style="letter-spacing:.06em">${esc(kanji)}</div>`
-      : `<div class="big" style="font-size:22px;line-height:1.4">${esc(maskAnswer(w.en || w.cn || "这个词", w.term))}</div>`;
-    const promptSub = hasKanji
-      ? esc(maskAnswer(glossOf(w), w.term))
-      : "拼出这个词的日语读法";
+    let promptBig, promptSub;
+    if (variant === "dictation") {
+      // 纯听写：不给任何文字，只给一个可重播的喇叭
+      promptBig = `<div class="big" id="dictPlay" style="cursor:pointer;font-size:46px">🔊</div>`;
+      promptSub = "听写：拼出你听到的词";
+    } else if (variant === "production") {
+      // 无提示拼写：只看释义，自己产出日语
+      promptBig = `<div class="big" style="font-size:21px;line-height:1.4">${esc(maskAnswer(glossOf(w), w.term))}</div>`;
+      promptSub = "拼出对应的日语（没有选项）";
+    } else if (variant === "cloze") {
+      // 例句挖空：在本课例句里挖掉目标词
+      const ex = (w.examples && w.examples[0]) || null;
+      let sent = (ex && ex.en) ? ex.en : "";
+      const target = kanji || answer;
+      if (sent && target && sent.indexOf(target) >= 0) sent = sent.replace(target, "＿＿＿");
+      else if (sent && answer && sent.indexOf(answer) >= 0) sent = sent.replace(answer, "＿＿＿");
+      promptBig = `<div class="big" style="font-size:20px;line-height:1.8">${esc(sent || "（缺例句）")}</div>`;
+      promptSub = ex && ex.cn ? esc(ex.cn) + " · 填入挖空的词" : "填入挖空的词";
+    } else {
+      promptBig = hasKanji
+        ? `<div class="big" style="letter-spacing:.06em">${esc(kanji)}</div>`
+        : `<div class="big" style="font-size:22px;line-height:1.4">${esc(maskAnswer(w.en || w.cn || "这个词", w.term))}</div>`;
+      promptSub = hasKanji
+        ? esc(maskAnswer(glossOf(w), w.term))
+        : "拼出这个词的日语读法";
+    }
     const KANA_ORDER =
       "あいうえお" +
       "かきくけこがぎぐげご" +
@@ -962,6 +1080,12 @@
     }));
     $("#kanaDel").addEventListener("click", () => { built.pop(); paint(); });
     $("#kanaClear").addEventListener("click", () => { built = []; paint(); });
+    if (variant === "dictation") {
+      const play = () => speak(w.term);
+      setTimeout(play, 250);
+      const dp = $("#dictPlay");
+      if (dp) dp.addEventListener("click", play);
+    }
     paint();
   }
 
@@ -972,8 +1096,11 @@
   function shuffle(arr) { const a = arr.slice(); for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; }
 
   function grade(w, correct, mode) {
+    const rtMs = questionTimer
+      ? questionTimer.activeMs + (questionTimer.visibleSince ? Date.now() - questionTimer.visibleSince : 0)
+      : 0;
     recordAnsweredQuestion();
-    scheduleNext(w, correct);
+    scheduleNext(w, correct, rtMs, false);
     session.results.push({ key: w.key, correct, mode });
     session.idx++;
     if (session.idx >= session.queue.length) finishSession();
@@ -1369,6 +1496,20 @@
       </div>
 
       <div class="card">
+        <div class="card-head"><h2>OIS 基础词库</h2><span class="sub">Phase 1 &amp; 2 · ${OIS_TERMS.length} 词</span></div>
+        <label class="row" style="gap:8px;font-size:13px;color:var(--ink-soft)">
+          <input type="checkbox" id="oisChk" ${prefs.ois ? "checked" : ""}/> 启用 OIS 基础词库（按组逐日解锁）
+        </label>
+        <div class="field" style="margin-top:10px">
+          <label>每天解锁新词数（1–50）</label>
+          <input type="number" id="oisPerDayInp" min="1" max="50" value="${prefs.oisPerDay}"/>
+        </div>
+        <p class="muted" style="margin-top:6px">${(function () { const s = oisStats(); return "已解锁 <b>" + s.unlocked + "</b> / " + s.total + " 词，已开始学习 <b>" + s.started + "</b> 词。"; })()}</p>
+        <button class="btn btn-mint" id="applyOisBtn" style="margin-top:10px">应用词库设置</button>
+        <p class="muted" style="margin-top:8px">词条与英文释义来自学校的 Quizlet 词表；例句为配套编写。复习间隔由 FSRS 按每个词的难度单独计算。</p>
+      </div>
+
+      <div class="card">
         <div class="card-head"><h2>课本进度 · Lesson 4</h2><span class="sub">まいにち / Everyday Life</span></div>
         <label class="row" style="gap:8px;font-size:13px;color:var(--ink-soft)">
           <input type="checkbox" id="lesson4Chk" ${prefs.lesson4 ? "checked" : ""}/> 启用 Lesson 4 词库（94 词，按课本顺序逐日解锁）
@@ -1395,11 +1536,13 @@
           </div>
         </div>
         <div class="field">
-          <label>毕业档位</label>
-          <select id="gradSel">
-            <option value="curve" ${prefs.graduation === "curve" ? "selected" : ""}>走完检索曲线 (推荐，记得更牢)</option>
-            <option value="5times" ${prefs.graduation === "5times" ? "selected" : ""}>累计答对 5 次即毕业</option>
+          <label>目标保留率（FSRS 调度）</label>
+          <select id="retentionSel">
+            <option value="0.8" ${Number(prefs.retention) === 0.8 ? "selected" : ""}>80%（复习最少，适合时间紧）</option>
+            <option value="0.85" ${(Number(prefs.retention) === 0.85 || prefs.retention == null) ? "selected" : ""}>85%（推荐）</option>
+            <option value="0.9" ${Number(prefs.retention) === 0.9 ? "selected" : ""}>90%（记得最牢，复习更多）</option>
           </select>
+          <p class="muted" style="margin-top:4px">每个词按难度和你的答题速度单独排期；保留率越低，复习次数越少。</p>
         </div>
         <div class="field">
           <label>拼写题（拼读音）占比</label>
@@ -1504,6 +1647,18 @@
       await syncPull();
     });
 
+    // OIS 基础词库
+    $("#applyOisBtn").addEventListener("click", () => {
+      prefs.ois = $("#oisChk").checked;
+      prefs.oisPerDay = Math.max(1, Math.min(50, parseInt($("#oisPerDayInp").value, 10) || 8));
+      persistPrefs();
+      syncOIS();
+      unlockDailyOIS();
+      toast(prefs.ois ? "OIS 词库已启用，今日新词已解锁" : "OIS 词库已暂停，已学进度保留", "gold");
+      updateBadges();
+      render();
+    });
+
     // 课本进度 · Lesson 4
     $("#applyL4Btn").addEventListener("click", () => {
       prefs.lesson4 = $("#lesson4Chk").checked;
@@ -1520,17 +1675,21 @@
     $("#savePrefsBtn").addEventListener("click", () => {
       prefs.reviewPerRound = parseInt($("#roundInp").value, 10) || 10;
       prefs.dailyGoal = parseInt($("#goalInp").value, 10) || 20;
-      prefs.graduation = $("#gradSel").value;
+      prefs.retention = parseFloat($("#retentionSel").value) || 0.85;
       prefs.kanaRatio = parseFloat($("#kanaRatioSel").value);
       prefs.ttsRate = parseFloat($("#rateInp").value) || 0.95;
       prefs.autoTTS = $("#autoTTS").checked;
       if ($("#lesson4Chk")) prefs.lesson4 = $("#lesson4Chk").checked;
       if ($("#newPerDayInp")) prefs.newWordsPerDay = Math.max(1, Math.min(30, parseInt($("#newPerDayInp").value, 10) || 8));
+      if ($("#oisChk")) prefs.ois = $("#oisChk").checked;
+      if ($("#oisPerDayInp")) prefs.oisPerDay = Math.max(1, Math.min(50, parseInt($("#oisPerDayInp").value, 10) || 8));
       prefs.apiTranslate = $("#apiTrInp").value.trim();
       prefs.apiExamples = $("#apiExInp").value.trim();
       persistPrefs();
       syncLesson4();
       unlockDailyL4();
+      syncOIS();
+      unlockDailyOIS();
       toast("已保存设置", "gold");
       updateBadges();
     });
@@ -1587,7 +1746,8 @@
   function wordTime(w, field) { return Number.isFinite(Number(w?.[field])) ? Number(w[field]) : 0; }
   function cloneWord(w) { return JSON.parse(JSON.stringify(w)); }
   function copyProgress(target, source) {
-    ["level", "graduated", "due", "correct", "lapses", "totalReviews", "reviewedAt", "updatedAt", "deck", "unlockDay"].forEach(k => {
+    ["level", "graduated", "due", "correct", "lapses", "totalReviews", "reviewedAt", "updatedAt", "deck", "unlockDay",
+     "fsrsS", "fsrsD", "fsrsLast", "fsrsReps", "lastGrade"].forEach(k => {
       if (Object.prototype.hasOwnProperty.call(source, k)) target[k] = source[k];
     });
   }
@@ -1653,7 +1813,8 @@
   function syncPayload() {
     return { type: "eggy-vocab", v: 2, at: Date.now(), state,
       prefs: { dailyGoal: prefs.dailyGoal, reviewPerRound: prefs.reviewPerRound, graduation: prefs.graduation,
-               lesson4: prefs.lesson4, newWordsPerDay: prefs.newWordsPerDay } };
+               lesson4: prefs.lesson4, newWordsPerDay: prefs.newWordsPerDay,
+               ois: prefs.ois, oisPerDay: prefs.oisPerDay, retention: prefs.retention } };
   }
 
   // ─────────── 房间码云同步 (textdb.dev，免登录、CORS 已实测可用) ───────────

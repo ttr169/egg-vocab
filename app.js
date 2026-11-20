@@ -422,7 +422,9 @@
     if (path && (!lang || /^ja/i.test(lang))) {
       const audio = new Audio(path);
       recordedAudio = audio;
-      audio.playbackRate = Math.min(1.4, Math.max(0.6, Number(prefs.ttsRate) || 0.95)) / 0.95;
+      // 预制音频本身已按 -10% 录制，默认原速播放；用户主动调慢/调快时才缩放
+      const ratePref = Number(prefs.ttsRate) || 0.9;
+      audio.playbackRate = Math.min(1.3, Math.max(0.7, ratePref / 0.9));
       audio.play().catch(() => {
         if (request === speechRequest) toast("音频播放失败，请再点一次朗读，并确认 audio 文件夹完整", "rose");
       });
